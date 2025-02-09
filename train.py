@@ -60,7 +60,7 @@ from datetime import timedelta
 # I/O
 
 out_dir='out'
-eval_interval = 1000
+eval_interval = 100
 log_interval = 10
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
@@ -71,8 +71,8 @@ wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
-# dataset = 'openwebtext'
-dataset = 'shakespear'
+dataset = 'openwebtext'
+# dataset = 'shakespear'
 gradient_accumulation_steps = 64 # used to simulate larger batch sizes
 batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
 # model
@@ -95,6 +95,10 @@ compile = False # use PyTorch 2.0 to compile the model to be faster
 # 
 time_limit_seconds = 1000000000     # stop after x seconds 
 max_iters_per_launch = 1000000000   # stop after x steps of the current
+gqa_groups = 0  # 0 means standard attention, otherwise number of K/V groups
+local_attention_window = -1  # -1 means full attention
+share_attention_params = False
+
 
 use_nGPT = 1
 learning_rate = 15e-4 
@@ -218,7 +222,11 @@ print("Data loading time: %f sec" % (time.time()-tdataloading_begin))
 
 # model init
 tmodelinit_begin = time.time()
-model_args = dict(use_nGPT=use_nGPT, n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size, base_scale=base_scale, 
+model_args = dict(use_nGPT=use_nGPT, n_layer=n_layer, n_head=n_head, n_embd=n_embd,
+                  block_size=block_size, base_scale=base_scale,
+                  gqa_groups=gqa_groups,
+                  local_attention_window=local_attention_window,
+                  share_attention_params=share_attention_params,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch

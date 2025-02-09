@@ -64,19 +64,21 @@ def get_sinusoidal_embeddings( n_positions, dim):
 
 
 class Block(nn.Module):
-
     def __init__(self, config, iblock):
         super().__init__()
         self.config = config
 
-        self.key = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
-        self.query = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
-        self.value = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
-        self.att_c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
+        # Only create attention parameters if not shared
+        if not config.share_attention_params:
+            self.query = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
+            self.key = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
+            self.value = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
+            self.att_c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
         
-        self.c_fc    = nn.Linear(config.n_embd, 2 * 4 * config.n_embd, bias=config.bias, dtype=torch.bfloat16)
-        self.silu    = nn.SiLU()
-        self.mlp_c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
+        # FFN parameters are never shared
+        self.c_fc = nn.Linear(config.n_embd, 2 * 4 * config.n_embd, bias=config.bias, dtype=torch.bfloat16)
+        self.silu = nn.SiLU()
+        self.mlp_c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
 
         if (config.use_nGPT == 0):
             self.rmsnorm_att = RMSNorm(config.n_embd)
@@ -112,14 +114,32 @@ class Block(nn.Module):
         if (self.config.use_nGPT == 0):
             hin = self.rmsnorm_att(h)
         
-        q = self.query(hin)
-        k = self.key(hin)
-        v = self.value(hin)
+        # Use shared parameters if enabled
+        if self.config.share_attention_params:
+            q = self.parent.shared_attn.query(hin)
+            k = self.parent.shared_attn.key(hin)
+            v = self.parent.shared_attn.value(hin)
+        else:
+            q = self.query(hin)
+            k = self.key(hin)
+            v = self.value(hin)
 
-        q = q.view(B, T, self.config.n_head, self.config.n_embd // self.config.n_head) 
-        k = k.view(B, T, self.config.n_head, self.config.n_embd // self.config.n_head)
-        v = v.view(B, T, self.config.n_head, self.config.n_embd // self.config.n_head)
+        # Handle GQA reshaping
+        if self.config.gqa_groups > 0:
+            # Reshape Q to full heads, K/V to grouped heads
+            q = q.view(B, T, self.config.n_head, self.config.n_embd // self.config.n_head)
+            k = k.view(B, T, self.config.gqa_groups, self.config.n_embd // self.config.gqa_groups)
+            v = v.view(B, T, self.config.gqa_groups, self.config.n_embd // self.config.gqa_groups)
+            # Repeat K/V for each group
+            heads_per_group = self.config.n_head // self.config.gqa_groups
+            k = k.repeat_interleave(heads_per_group, dim=2)
+            v = v.repeat_interleave(heads_per_group, dim=2)
+        else:
+            q = q.view(B, T, self.config.n_head, self.config.n_embd // self.config.n_head)
+            k = k.view(B, T, self.config.n_head, self.config.n_embd // self.config.n_head)
+            v = v.view(B, T, self.config.n_head, self.config.n_embd // self.config.n_head)
 
+        # Apply rotary embeddings and normalization as before
         sinusoidal_pos = get_sinusoidal_embeddings(T, self.config.n_embd // self.config.n_head).to(device=q.device)
         q, k = apply_rotary_position_embeddings(sinusoidal_pos, q.transpose(1, 2), k.transpose(1, 2))
         q = q.transpose(2, 1)
@@ -127,13 +147,27 @@ class Block(nn.Module):
 
         if (self.config.use_nGPT == 1):
             sqk = (self.sqk * (self.sqk_init_value/self.sqk_init_scaling)).view(1, 1, self.config.n_head, self.config.n_embd // self.config.n_head)
-            q = sqk * self.justnorm(q)  
-            k = sqk * self.justnorm(k)  
+            q = sqk * self.justnorm(q)
+            k = sqk * self.justnorm(k)
 
         sqrt_head_dim = (self.config.n_embd / self.config.n_head) ** 0.5
         if (self.config.use_nGPT == 0): softmax_scale = 1.0 / sqrt_head_dim 
         if (self.config.use_nGPT == 1): softmax_scale = sqrt_head_dim 
-        y = flash_attn_func(q.to(dtype=torch.bfloat16), k.to(dtype=torch.bfloat16), v.to(dtype=torch.bfloat16), dropout_p=0.0, softmax_scale=softmax_scale, causal=True, window_size=(-1, -1), alibi_slopes=None, deterministic=True)
+
+        # Update flash attention call to use local window if configured
+        window_size = (self.config.local_attention_window, 0) if self.config.local_attention_window > 0 else (-1, -1)
+        
+        y = flash_attn_func(
+            q.to(dtype=torch.bfloat16), 
+            k.to(dtype=torch.bfloat16), 
+            v.to(dtype=torch.bfloat16), 
+            dropout_p=0.0, 
+            softmax_scale=softmax_scale, 
+            causal=True, 
+            window_size=window_size,
+            alibi_slopes=None, 
+            deterministic=True
+        )
         y = y.to(dtype=q.dtype)
         y = y.contiguous().view(B, T, self.config.n_embd)
 
@@ -190,6 +224,11 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = False 
 
+    # New parameters
+    gqa_groups: int = 0  # 0 means standard attention, otherwise number of K/V groups
+    local_attention_window: int = -1  # -1 means full attention
+    share_attention_params: bool = False
+
 class RMSNorm(torch.nn.Module):
     def __init__(self, embdim: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -206,18 +245,28 @@ class RMSNorm(torch.nn.Module):
 
 
 class GPT(nn.Module):
-
     def __init__(self, config):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
 
+        # Create shared attention parameters if enabled
+        self.shared_attn = None
+        if config.share_attention_params:
+            self.shared_attn = nn.ModuleDict(dict(
+                query = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16),
+                key = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16),
+                value = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16),
+                att_c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
+            ))
+
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config, il) for il in range(config.n_layer)])
         ))
+
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
