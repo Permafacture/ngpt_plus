@@ -95,10 +95,10 @@ compile = False # use PyTorch 2.0 to compile the model to be faster
 # 
 time_limit_seconds = 1000000000     # stop after x seconds 
 max_iters_per_launch = 1000000000   # stop after x steps of the current
-gqa_groups = 0  # 0 means standard attention, otherwise number of K/V groups
+n_head_k = 0  # 0 or n_head==n_head_k means standard attention, otherwise number of K/V groups
 local_attention_window = -1  # -1 means full attention
 share_attention_params = False
-
+weight_tying=False
 
 use_nGPT = 1
 learning_rate = 15e-4 
@@ -224,9 +224,10 @@ print("Data loading time: %f sec" % (time.time()-tdataloading_begin))
 tmodelinit_begin = time.time()
 model_args = dict(use_nGPT=use_nGPT, n_layer=n_layer, n_head=n_head, n_embd=n_embd,
                   block_size=block_size, base_scale=base_scale,
-                  gqa_groups=gqa_groups,
+                  n_head_k=n_head_k,
                   local_attention_window=local_attention_window,
                   share_attention_params=share_attention_params,
+                  weight_tying=weight_tying,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
@@ -351,12 +352,14 @@ def get_hparams_str(model):
     
     for layer_idx in range(0, config.n_layer):
         block = transformer["h"][layer_idx] 
-        sqk = block.sqk * (block.sqk_init_value/block.sqk_init_scaling)
+        sqk_q = block.sqk_q * (block.sqk_init_value/block.sqk_init_scaling)
+        sqk_k = block.sqk_k * (block.sqk_init_value/block.sqk_init_scaling)
         attn_alpha = block.attn_alpha * (block.attn_alpha_init_value / block.attn_alpha_init_scaling)
         mlp_alpha = block.mlp_alpha * (block.mlp_alpha_init_value / block.mlp_alpha_init_scaling)
         suv = block.suv * (block.suv_init_value/block.suv_init_scaling)
 
-        resstr = resstr + "%.5f " % torch.mean( sqk )
+        resstr = resstr + "%.5f " % torch.mean( sqk_q )
+        resstr = resstr + "%.5f " % torch.mean( sqk_k )
         resstr = resstr + "%.5f " % torch.mean( attn_alpha )
         resstr = resstr + "%.5f " % torch.mean( mlp_alpha )
         resstr = resstr + "%.5f " % torch.mean( suv )
@@ -403,18 +406,27 @@ def justnorm(x, idim=-1):
 def normalize_matrices():
     transformer.wte.weight.data.copy_(justnorm(transformer.wte.weight.data, 1))         # V, n_embd
     module.lm_head.weight.data.copy_(justnorm(module.lm_head.weight.data, 1))           # V, n_embd
-    
+
+    if config.share_attention_params:
+        # Normalize shared attention parameters
+        transformer.shared_attn.query.weight.data.copy_(justnorm(transformer.shared_attn.query.weight.data, 1))
+        transformer.shared_attn.key.weight.data.copy_(justnorm(transformer.shared_attn.key.weight.data, 1))
+        transformer.shared_attn.value.weight.data.copy_(justnorm(transformer.shared_attn.value.weight.data, 1))
+        transformer.shared_attn.att_c_proj.weight.data.copy_(justnorm(transformer.shared_attn.att_c_proj.weight.data, 0))
 
     for layer_idx in range(0, config.n_layer):
         block = transformer["h"][layer_idx]
 
-        block.query.weight.data.copy_(justnorm(block.query.weight.data, 1))             # n_proj, n_embd
-        block.key.weight.data.copy_(justnorm(block.key.weight.data, 1))                 # n_proj, n_embd
-        block.value.weight.data.copy_(justnorm(block.value.weight.data, 1))             # n_proj, n_embd
-        block.att_c_proj.weight.data.copy_(justnorm(block.att_c_proj.weight.data, 0))   # n_embd, n_proj
+        if not config.share_attention_params:
+            # Only normalize block-level attention parameters if not shared
+            block.query.weight.data.copy_(justnorm(block.query.weight.data, 1))
+            block.key.weight.data.copy_(justnorm(block.key.weight.data, 1))
+            block.value.weight.data.copy_(justnorm(block.value.weight.data, 1))
+            block.att_c_proj.weight.data.copy_(justnorm(block.att_c_proj.weight.data, 0))
 
-        block.c_fc.weight.data.copy_(justnorm(block.c_fc.weight.data, 1))               # n_proj, n_embd
-        block.mlp_c_proj.weight.data.copy_(justnorm(block.mlp_c_proj.weight.data, 0))   # n_embd, n_proj
+        # Always normalize FFN parameters as they're never shared
+        block.c_fc.weight.data.copy_(justnorm(block.c_fc.weight.data, 1))
+        block.mlp_c_proj.weight.data.copy_(justnorm(block.mlp_c_proj.weight.data, 0))
 
 if (use_nGPT == 1):
     normalize_matrices()

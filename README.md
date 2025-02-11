@@ -1,3 +1,37 @@
+This is a fork of NVIDIA's nGPT repo, which itself is largely taken from nano-gpt
+
+The purpose of this fork is primarily to experiment with with different
+modifications of GPT type transformers:
+
+    * Normalized Transformer Architecture (nGPT)
+    * Grouped Query Attention (GQA)
+    * Weight Tying
+    * Attention parameter sharing (ALBERT)
+    * Sliding Window Attention (SWA)
+
+**Contributing**: Contributions are welcome.  Feel free to open a ticket
+
+Note on parameter reduction:
+
+I did this so I could experiment with LLMs on my little RTX 3090, hoping
+I could get larger models with parameter reducing techniques. That
+didn't turn out to be the case.
+
+None of these techniques save a noticeable amount of train time vRAM.
+The attention parameters are a small fraction of the total parameters
+of the model, so GQA and even parameter sharing have negligible impact.
+Weight tying does reduce the size of the final model significantly,
+but train time memory usage is not affected. Flash Attention already
+implemented memory efficient attention and so windowed attention
+is just a mask with no reduction in parameters.
+
+These techniques mostly provide regularization or smaller final model
+size.
+
+
+## Original README
+
+
 Copyright(c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  
 MIT License
